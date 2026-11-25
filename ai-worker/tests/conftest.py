@@ -1,0 +1,110 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from hoso_ai.contracts import Job, PageInfo
+from hoso_ai.queue.memory import InMemoryRepository
+from hoso_ai.queue.repository import Catalog, DocumentTypeDef, FieldDef
+from hoso_ai.settings import Settings
+
+LONG_TEXT = "ỦY BAN NHÂN DÂN PHƯỜNG TỪ LIÊM. Kế hoạch thực hiện nhiệm vụ năm 2026 theo chỉ đạo của cấp trên. " * 2
+
+
+class FakeReader:
+    """PDF giả: trang 1 có lớp chữ sạch, trang 2 chứa ảnh, trang 3 chữ quá ngắn."""
+
+    def __init__(self, pages: list[PageInfo] | None = None):
+        self.pages = pages or [
+            PageInfo(1, LONG_TEXT, has_images=False),
+            PageInfo(2, LONG_TEXT, has_images=True),
+            PageInfo(3, "Trang", has_images=False),
+        ]
+        self.rendered: list[int] = []
+
+    def inspect(self, pdf: Path, max_pages: int) -> list[PageInfo]:
+        return self.pages
+
+    def render(self, pdf: Path, page_no: int, out_dir: Path) -> Path:
+        from PIL import Image, ImageDraw
+
+        out_dir.mkdir(parents=True, exist_ok=True)
+        image = Image.new("RGB", (600, 800), "white")
+        ImageDraw.Draw(image).rectangle((50, 50, 550, 400), fill="black")
+        target = out_dir / f"page-{page_no}.png"
+        image.save(target)
+        self.rendered.append(page_no)
+        return target
+
+
+class FakeStorage:
+    def __init__(self, path: Path, error: Exception | None = None):
+        self.path, self.error = path, error
+
+    def open_verified(self, storage_key: str, sha256: str) -> Path:
+        if self.error:
+            raise self.error
+        return self.path
+
+
+@pytest.fixture
+def settings(tmp_path: Path) -> Settings:
+    return Settings.from_env({
+        "HOSO_AI_PROFILE": "fake",
+        "HOSO_AI_WORK_ROOT": str(tmp_path / "work"),
+        "HOSO_AI_STORAGE_ROOT": str(tmp_path / "blobs"),
+        "HOSO_AI_WORKER_ID": "test-worker",
+        "HOSO_AI_HEARTBEAT_SECONDS": "5",
+        "HOSO_AI_MAX_ATTEMPTS": "3",
+    })
+
+
+@pytest.fixture
+def catalog() -> Catalog:
+    fields = (FieldDef("U02-D01-F1", "Số/ký hiệu", "text", True), FieldDef("U02-D01-F2", "Ngày ban hành/lập", "date", True))
+    return Catalog({"U02": "Chỉ đạo, điều hành"}, {"U02-D01": DocumentTypeDef("U02-D01", "Kế hoạch", "U02", fields)})
+
+
+@pytest.fixture
+def repo(catalog: Catalog) -> InMemoryRepository:
+    return InMemoryRepository(catalog)
+
+
+def make_job(job_id: str = "job-1", **options) -> Job:
+    return Job(id=job_id, file_id="file-1", document_id="doc-1", storage_key="blobs/aa/bb/" + "a" * 64,
+               sha256="a" * 64, page_count=3, options=options)
+
+
+# Mô hình mặc định: bản 4-bit tự chuyển từ nguồn BF16, nhận diện qua conversion-receipt.json.
+CLASSIFIER = "Qwen3-4B-Instruct-2507-ifstruct-4bit"
+CLASSIFIER_SOURCE = {"repo": "ChetanDhembreAI/Qwen3-4B-Instruct-2507-ifstruct", "revision": "00161de525486e01ba505e6c24f39472fdfe4a23"}
+# Mô hình khác tải thẳng từ mlx-community (nhận diện qua README và siêu dữ liệu tải), để thử đổi mô hình bằng cấu hình.
+REVISIONS = {"Qwen3-1.7B-4bit": "3b1b1768f8f8cf8351c712464f906e86c2b8269e"}
+
+
+@pytest.fixture
+def fake_models(tmp_path: Path, monkeypatch) -> Path:
+    """Thư mục mô hình giả (chỉ có tệp mô tả, không có trọng số thật) để thử chọn mô hình mà không cần máy AI."""
+    import document_ai.config as config
+
+    root = tmp_path / "models"
+    for name, revision in REVISIONS.items():
+        folder = root / name
+        (folder / ".cache/huggingface/download").mkdir(parents=True)
+        (folder / "config.json").write_text("{}", encoding="utf-8")
+        (folder / "model.safetensors").write_bytes(b"")
+        (folder / "README.md").write_text(f"# mlx-community/{name}\n", encoding="utf-8")
+        (folder / ".cache/huggingface/download/config.json.metadata").write_text(f"{revision}\netag\n123\n", encoding="utf-8")
+    converted = root / CLASSIFIER
+    converted.mkdir(parents=True)
+    (converted / "config.json").write_text("{}", encoding="utf-8")
+    (converted / "model.safetensors").write_bytes(b"")
+    (converted / "README.md").write_text("# Tiêu đề do công cụ chuyển ghi\n", encoding="utf-8")
+    (converted / "conversion-receipt.json").write_text(json.dumps(CLASSIFIER_SOURCE), encoding="utf-8")
+    monkeypatch.setattr(config, "MODEL_ROOT", root)
+    monkeypatch.delenv("HOSO_AI_CLASSIFIER_MODEL", raising=False)
+    monkeypatch.delenv("HOSO_AI_CLASSIFIER_GB", raising=False)
+    monkeypatch.setenv("HOSO_AI_SHORTLIST", "off")      # các test này kiểm đường hỏi mô hình đủ ba bước; thu hẹp có test riêng (test_shortlist.py)
+    return root

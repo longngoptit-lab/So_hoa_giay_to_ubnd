@@ -1,0 +1,195 @@
+# Backend · HoSoSo API (.NET 10)
+
+ASP.NET Core trên .NET 10 LTS, EF Core 10 + Npgsql, PostgreSQL 16.
+
+- Kiến trúc: [docs/02-kien-truc-server.md](../docs/02-kien-truc-server.md)
+- Cơ sở dữ liệu: [docs/03-thiet-ke-csdl.md](../docs/03-thiet-ke-csdl.md)
+- Task: [docs/tasks/backend.md](../docs/tasks/backend.md)
+- Bảo mật: [docs/05-bao-mat.md](../docs/05-bao-mat.md)
+- Log: [docs/06-log-va-giam-sat.md](../docs/06-log-va-giam-sat.md)
+
+> **Đã build và kiểm thử** với SDK 11.0.100 nhắm `net10.0`: 288 test qua trên PostgreSQL 16 thật (15 trong số đó cần một máy chủ tương thích S3 cục bộ, xem mục "Kho tệp S3"; không có thì được bỏ qua) (xem [docs/tasks/backend.md](../docs/tasks/backend.md) mục "Kết quả kiểm chứng").
+
+## .NET SDK
+
+Dự án nhắm **.NET 10 LTS** (`net10.0`) vì Npgsql chưa có bản ổn định cho EF Core 11. Máy dev có SDK 11 vẫn build được:
+`global.json` đặt `rollForward: latestMajor`. Máy chỉ có runtime 11 (chưa cài runtime 10) thì khi chạy hay test cần
+`DOTNET_ROLL_FORWARD=Major`; máy chủ thật dùng runtime 10 nên không cần. `dotnet test` dùng Microsoft.Testing.Platform (cấu hình trong `global.json`).
+
+```sh
+export PATH=/usr/local/share/dotnet:$PATH      # nếu shell chưa thấy dotnet
+```
+
+## Chạy khi dev
+
+```sh
+docker compose -f ../docker-compose.dev.yml up -d postgres   # PostgreSQL 16 (hoặc PostgreSQL cài sẵn)
+dotnet run --project src/HoSoSo.Api -- migrate --dry-run     # chỉ liệt kê script sẽ chạy
+dotnet run --project src/HoSoSo.Api -- migrate               # chạy migration trong database/migrations
+dotnet run --project src/HoSoSo.Api                          # http://localhost:5080, tài liệu API: /docs
+```
+
+Migration `*_optional.sql` (dữ liệu mẫu 004, 007, 021) mặc định chạy ngoài Production; đặt `Database:OptionalSeeds=["004"]` để chọn đúng tệp.
+**Với CSDL dev có sẵn dữ liệu (như `hoso_dev`) đừng chạy `migrate` trần**: nó nạp luôn mọi tệp `*_optional.sql` chưa có trong nhật ký (kể cả 004: người dùng và hồ sơ GIẢ LẬP). Dùng `scripts/migrate-hoso-dev.sh` (mặc định chỉ liệt kê; thêm `--apply` để chạy thật) rồi sao lưu trước bằng `pg_dump -Fc -n hoso -n public`. **Muốn khôi phục bản dump đó phải tạo extension trước và bỏ mục `CREATE SCHEMA public`** (xem [ops/backup/README.md](../ops/backup/README.md)).
+
+## Bản sửa luồng backend 17/11/2026 (BE-101–109)
+
+Chạy migration **034_disposal_recovery.sql** và **035_metadata_review.sql** trước khi khởi động API mới. Dùng quy trình migration/sao lưu ở trên; các lần kiểm thử bản sửa chỉ migrate CSDL thử nghiệm riêng, chưa áp dụng lên `hoso_dev` hoặc production. Không hạ về API cũ khi còn yêu cầu hủy `executing`.
+
+- Hủy hồ sơ ghi `executing`, chặn nội dung và lưu `disposal_blob_deletions` trong cùng giao dịch; xóa kho chỉ bắt đầu sau commit. `POST /disposals/{id}/execute` trả 200 với `disposal.status` là `executed` hoặc `executing`. Trường hợp sau, đọc lại `GET /disposals/{id}` để theo dõi; gọi execute lần hai trả 409. Bật `Background:Enabled=true` trên máy chủ để worker tiếp tục sau khi request bị ngắt hoặc tiến trình khởi động lại.
+- Worker kiểm việc mỗi 5 giây, thử lại lỗi kho với khoảng chờ tăng dần, tối đa một giờ. `attempts`, `next_attempt_at`, `last_error` ghi trong bảng hàng đợi; `last_error` chỉ chứa loại lỗi. Khi DB lỗi lúc chốt kết quả, xóa lại cùng khóa là an toàn. `blobsDeleted` đếm các lần xóa có kết quả được commit; không thể xác định chính xác lần xóa trước một sự cố commit. Nội dung còn tham chiếu từ tệp, preview, mẫu biểu hoặc gói xuất được giữ lại.
+- `PUT /documents/{id}/metadata`: gửi `version`, `title`, `documentForm`, `documentNumber`, `issuedOn`, `note`. Xác nhận lưu người/thời điểm/ghi chú và audit; sửa giá trị làm giấy tờ cần đối chiếu lại. Dữ liệu cũ không được tự xác nhận. `needs_review` chặn checklist và thao tác trình như quy tắc SQL.
+- **Đổi hợp đồng inbox:** `GET /intake/inbox?status=inbox&limit=50&cursor=...` trả `{ items, nextCursor }` thay mảng. `limit` từ 1–200, mặc định 50; dùng `nextCursor` tới khi null. Thứ tự giảm dần theo thời điểm tải và ID tệp; dữ liệu cũ thiếu thời điểm tải dùng thời điểm tạo giấy tờ.
+- OpenAPI tại `frontend/src/api/openapi.json` đã cập nhật. Trang tiếp nhận/đối chiếu frontend hiện dùng dữ liệu mẫu; phần nối API cần dùng hợp đồng mới và cung cấp bước xác nhận metadata (xem `docs/tasks/frontend.md`).
+
+Các kiểm thử hồi quy nằm ở `BackendReliabilityTests` (đồng thời, quyền, metadata, hủy/khôi phục, tìm kiếm và phân trang) và `AiQueueModelTests` (thứ tự, ước tính, tràn số). Bộ kiểm thử hiện có tiếp tục kiểm tra dữ liệu dùng chung, SSE theo phân công, nộp lưu và các thao tác lô quét.
+
+## Đăng nhập thử khi dev
+
+### Bộ 850 hồ sơ giả lập Từ Liêm
+
+Đã nhập vào `hoso_dev` local ngày 16/11/2026 bằng `scripts/import_synthetic_dossiers.py`:
+850 hồ sơ `TEST-TL-*`, 3.560 giấy tờ thành phần và 850 PDF gộp tham chiếu. Cộng dữ liệu cũ:
+**853 hồ sơ, 4.441 giấy tờ, 4.448 tệp**. Toàn bộ bộ mới có `origin=demo`, hồ sơ `draft`,
+giấy tờ `pending`/`needs_review`, `intake_status=filed`. PDF được chép vào `Storage:Root`
+theo khóa `blobs/ab/cd/<sha256>`; chỉ có đường dẫn nguồn trên ổ đĩa thì API không mở được tệp.
+
+Các bộ được xếp vào **U27 · Hồ sơ tiếp nhận và trả kết quả TTHC** (`mc`, `tl-ubnd`) để kiểm thử tiếp nhận.
+Đơn vị trong bộ nguồn được giữ trong ghi chú/metadata, chưa xác nhận phân phòng chuyên môn.
+786 bộ gắn thủ tục theo đúng ID nguồn; 64 bộ mô phỏng lịch sử có mã thủ tục trong ghi chú và
+`source_observations`, để `procedure_id=NULL` vì backend không cho chọn thủ tục đã bị thay thế/bãi bỏ khi tạo hồ sơ mới.
+PDF gộp có `relation_kind=reference`, tránh đếm hai lần thành phần. Không nhập đáp án JSON vào
+`document_field_values`, không tạo kết quả OCR hoặc tự chạy hàng nghìn job OCR.
+
+Đăng nhập `dev_admin`, chọn **Văn thư / lưu trữ · UBND**, **Trưởng phòng Một cửa** hoặc **Chủ tịch UBND** để xem.
+`technical_admin` không có quyền đọc nội dung hồ sơ. Trên DBeaver, Refresh bảng `hoso.dossiers`
+hoặc chạy `SELECT count(*) FROM hoso.dossiers WHERE code LIKE 'TEST-TL-%';` để thấy 850 bộ.
+
+Chạy từ thư mục gốc repository:
+
+```sh
+python3 -m venv backend/.venv
+backend/.venv/bin/python -m pip install -r backend/scripts/requirements-import.txt
+# Mặc định kiểm toàn bộ PDF, thử INSERT cùng constraints/triggers rồi ROLLBACK.
+# Sequence nhật ký PostgreSQL vẫn có thể tăng khi rollback; không tạo bản ghi nghiệp vụ.
+backend/.venv/bin/python backend/scripts/import_synthetic_dossiers.py
+# Chép PDF, pg_dump đầy đủ trước khi ghi, rồi COMMIT một giao dịch.
+backend/.venv/bin/python backend/scripts/import_synthetic_dossiers.py --apply \
+  --report artifacts/tuliem-import/applied.json
+```
+
+Kết nối mặc định `host=127.0.0.1 port=5432 dbname=hoso_dev`, user theo môi trường PostgreSQL.
+Có thể đặt `HOSO_IMPORT_DSN` và `--storage-root` để khớp môi trường dev. Script chỉ nhận host local
+và database `hoso_dev`/`hoso_import_test_*`, xác minh SHA-256/kích thước/số trang và dùng UUID ổn định.
+Chạy lại không sửa dữ liệu đã có; xung đột mã hoặc nội dung tệp sẽ hủy giao dịch. Nếu ghi DB thất bại sau
+khi chép tệp, blob chưa được tham chiếu được giữ lại để lần chạy sau tái sử dụng.
+Bản sao lưu đầy đủ ở `data/db-backups/before-tuliem-import-*.dump` gồm cả extension (khác bản dump lọc schema).
+
+**Đã kiểm:** 4.410 blob khớp SHA-256; liên kết của đủ 850 bộ; nhập lần hai tạo 0 dòng;
+API phân trang trả đủ 850 bộ; chi tiết/checklist và PDF đầy đủ/HTTP Range cho ba bộ đại diện
+(có bộ lịch sử); tài khoản quản trị kỹ thuật bị chặn đọc nội dung; 29 test
+`DossierWorkflowTests`, `IntakeReviewTests`, `AssignmentScopeTests`, `ProcedureChecklistTests` đạt.
+Biên bản local: `artifacts/tuliem-import/verification.json`, `applied.json`, `repeated.json`, `backend-tests.log`.
+
+Máy Homebrew hiện dùng PostgreSQL role `quoc`; cấu hình kết nối API và migrator đã lưu vào
+.NET user-secrets (`hoso-api-dev`) trên máy này. Cấu hình Docker trong repository vẫn dùng các role dev riêng.
+Trên máy khác, đặt chuỗi kết nối đúng bằng biến môi trường hoặc `dotnet user-secrets set` trước khi chạy API.
+
+### Tài khoản và phân công dev
+
+Môi trường Development dùng `Auth:Mode=Dev`: mở `/api/v1/auth/login` để chọn người dùng GIẢ LẬP (cột `users.is_demo`), hoặc gọi thẳng
+`/api/v1/auth/dev-login?username=<tên>`. Tài khoản quản trị dev là `dev_admin` (xem migration `021_dev_admin_optional.sql`); có 18 phân công để thử mọi vai trò.
+`technical_admin` quản trị người dùng/cấu hình nhưng **không đọc nội dung hồ sơ** theo thiết kế; đổi sang phân công khác để xem hồ sơ.
+
+CSDL dev đã cài từ trước bằng `database/install.sql` (chưa có nhật ký DbUp) thì đánh dấu baseline một lần rồi nâng cấp:
+
+```sh
+dotnet run --project src/HoSoSo.Api -- migrate --baseline 000,001,002,003,007   # đúng những script đã thật sự chạy
+dotnet run --project src/HoSoSo.Api -- migrate --dry-run
+dotnet run --project src/HoSoSo.Api -- migrate
+```
+
+## Chạy test
+
+Test tích hợp cần PostgreSQL thật. Hai cách:
+
+```sh
+# 1) PostgreSQL có sẵn (không cần Docker): mỗi lớp test tạo CSDL riêng bằng CREATE DATABASE ... TEMPLATE
+HOSO_TEST_PG="Host=127.0.0.1;Port=5432;Username=postgres" dotnet test --solution HoSoSo.slnx
+# 2) Docker: bỏ trống HOSO_TEST_PG, Testcontainers tự dựng postgres:16-alpine
+dotnet test --solution HoSoSo.slnx
+```
+
+Không có PostgreSQL lẫn Docker thì các test cần CSDL được **bỏ qua** (skip) kèm lý do, không báo đỏ giả.
+
+### Kho tệp S3 và đăng nhập OIDC khi test
+
+- **S3/MinIO:** đặt `HOSO_TEST_S3_URL` (ví dụ `http://127.0.0.1:9000`) trỏ tới một máy chủ tương thích S3 cục bộ để chạy 15 test kho S3 (cần quyền tạo bucket; khóa thử `HOSO_TEST_S3_ACCESS`/`HOSO_TEST_S3_SECRET`, mặc định `test`/`test`). Không đặt thì các test này báo "bỏ qua".
+  Lần kiểm chứng gần nhất dùng emulator `moto` (`pip install 'moto[server]'`, `moto_server -p 5099`), **chưa chạy với MinIO hay AWS S3 thật**.
+- **OIDC:** test `OidcLoginTests` chạy luồng đăng nhập thật qua một nhà cung cấp OIDC giả theo đúng giao thức (`Support/FakeOidcProvider.cs`), không cần Keycloak. Nó không thay việc thử trên Keycloak của cơ quan.
+Kiểm tra worker Python với CSDL: xem [ai-worker/README.md](../ai-worker/README.md).
+
+`appsettings.Development.json` đặt `Auth:Mode=Dev`:
+- mở `http://localhost:3000/dang-nhap` (frontend với `HOSO_MOCK=0`), hoặc mở thẳng `http://localhost:5080/api/v1/auth/login`, để chọn tài khoản mẫu;
+- API từ chối khởi động nếu bật Dev ở môi trường khác Development.
+
+## Cấu trúc
+
+```
+backend/
+├─ HoSoSo.slnx · global.json · Directory.Build.props · Directory.Packages.props
+├─ database/migrations/          SQL chạy bằng DbUp theo thứ tự tên tệp (001… baseline, 008… mới)
+├─ src/
+│  ├─ HoSoSo.Domain/             Identity (quyền, vai trò mặc định) · Workflow · Entities (thực thể ánh xạ bảng)
+│  ├─ HoSoSo.Application/        Use case theo module: Catalog, Dossiers, Intake (lô quét, tải lên, job), Documents (đối chiếu, tách, chữ ký),
+│  │                             Operations (kho bản giấy, mượn trả, nộp lưu, xuất gói, hủy), Procedures, Search, Admin, Notifications
+│  ├─ HoSoSo.Infrastructure/     HoSoDbContext + ModelMapping, ScopeFilter, IdentityService, DatabaseMigrator, LocalFileStorage,
+│  │                             Messaging (LISTEN, outbox, bus SSE, thu hồi job treo, nhắc hạn, ExportWorker), Auditing (nhật ký truy cập), Health,
+│  │                             Pdf (đếm/cắt trang, đọc chữ ký, dựng nhãn QR và biên bản; font Be Vietnam Pro OFL nhúng sẵn)
+│  └─ HoSoSo.Api/
+│     ├─ Program.cs              Thứ tự middleware; lệnh "migrate"
+│     ├─ Endpoints/              Toàn bộ /api/v1; endpoint chưa làm trả 501 kèm mã task (hiện không còn endpoint nào như vậy)
+│     ├─ Security/               Cookie + OIDC, policy quyền động "perm:…", người dùng hiện tại
+│     ├─ Middleware/             Mã tương quan, CSRF, header bảo mật, phân công đang dùng (X-Assignment-Id)
+│     ├─ Errors/                 GlobalExceptionHandler → ProblemDetails + errorId
+│     └─ Observability/          Serilog JSON, OpenTelemetry, GlitchTip (khi có DSN)
+└─ tests/
+   ├─ HoSoSo.Domain.Tests/       Luật chuyển bước, quyền mặc định
+   ├─ HoSoSo.Application.Tests/
+   └─ HoSoSo.Api.IntegrationTests/  Migration, danh tính và phân công, phạm vi theo vai trò, quy trình hồ sơ,
+                                    tải PDF → AI → đối chiếu, SSE/outbox, quét quyền mọi endpoint
+```
+
+## Cấu hình vận hành (khóa chính)
+
+Bí mật luôn đặt bằng biến môi trường (dấu `__` thay cho `:`), không ghi vào tệp cấu hình.
+
+| Khóa | Ý nghĩa | Mặc định |
+|---|---|---|
+| `Storage:Provider` | `Local` (ổ đĩa) hoặc `S3` (S3/MinIO). Khóa tệp giống nhau ở hai kho nên chuyển kho là chép tệp. | `Local` |
+| `Storage:Root` | Thư mục blob (Local) hoặc thư mục tạm khi ghi/đóng gói (S3) | `/var/lib/hoso/blobs` |
+| `Storage:S3:ServiceUrl`, `Region`, `Bucket`, `ForcePathStyle`, `Prefix`, `ServerSideEncryption` | Địa chỉ dịch vụ (trống = AWS), vùng, bucket, kiểu địa chỉ, tiền tố khóa, mã hóa phía máy chủ | xem `appsettings.json` |
+| `Storage__S3__AccessKey`, `Storage__S3__SecretKey` | Khóa truy cập; để trống cả hai thì dùng vai trò IAM/biến `AWS_*` | trống |
+| `Backup__IngestToken` | Khóa máy (từ 32 ký tự) cho script sao lưu gọi `POST /api/v1/ops/backups` bằng header `X-Backup-Token`. Trống = các endpoint `/ops` trả 404. | trống |
+| `Backup:MaxAgeHours` / `RestoreTestMaxDays` / `StuckRunningHours` / `WatchdogMinutes` | Ngưỡng cảnh báo sao lưu quá hạn / chưa diễn tập khôi phục / chạy treo, và chu kỳ kiểm tra (0 = tắt) | 26 / 100 / 12 / 15 |
+| `Auth:DataProtectionKeysPath` | Thư mục lưu khóa mã hóa cookie phiên; đặt (và dùng chung giữa các instance) khi chạy container, không thì mất khóa là mọi người phải đăng nhập lại | trống |
+| Cài đặt `dossier.enforce_procedure_components` (bảng `system_settings`, sửa bằng `PATCH /api/v1/admin/settings`) | `true` = thiếu thành phần bắt buộc của thủ tục thì khóa các bước cần giấy tờ đã đối chiếu; mặc định `false` (chỉ cảnh báo) | `false` |
+| `Limits:MaxPdfPages` | PDF nhiều trang hơn bị từ chối ngay khi tải lên (422 `pdf_too_large`) | 500 |
+| `Antivirus:Enabled`, `Host`, `Port`, `TimeoutSeconds`, `FailOpen` | Quét ClamAV (clamd, TCP 3310) trước khi lưu tệp tải lên. Bị chặn: 422 `file_infected`. Máy quét lỗi: mặc định từ chối (503 `scanner_unavailable`), `FailOpen=true` thì nhận và ghi cảnh báo. Đặt `StreamMaxLength` của clamd không nhỏ hơn `Limits:UploadMaxBytes`. | tắt |
+| `PdfSandbox:Mode` | `Process` (mặc định, **bắt buộc ở Production**): đếm trang/cắt/đọc chữ ký/dựng ảnh PDF chạy trong tiến trình con có hạn giờ và bộ nhớ; `InProcess` chỉ để phát triển | `Process` |
+| `PdfSandbox:TimeoutSeconds` / `MaxMemoryMb` / `MaxConcurrency` / `MaxOutputMb` / `Command` | Hạn giờ, bộ nhớ làm việc, số tiến trình đồng thời, dung lượng kết quả của tiến trình con; `Command` để bọc thêm (ví dụ `systemd-run --scope -p MemoryMax=2G`) | 30 / 1536 / 2 / 64 / trống |
+| `Auth:MfaRequiredRoles` | Vai trò (cách nhau bằng dấu phẩy) chỉ dùng được khi phiên đã qua MFA; trống = tắt. Cần Keycloak phát `amr`/`acr` (SEC-01) | `technical_admin,chair,council,clerk` |
+| `Auth:MfaAmrValues` / `MfaAcrValues` / `MfaAcrRequest` | Giá trị `amr` và `acr` coi là MFA; `acr_values` gửi khi yêu cầu đăng nhập lại có MFA | `mfa,otp,hwk,swk,fpt,sms,face,retina,vbm` / trống / trống |
+| `Auth:DataProtectionCertificatePath` + `Auth__DataProtectionCertificatePassword` | Chứng thư .pfx mã hóa khóa Data Protection khi lưu; Production bắt buộc (hoặc `Auth:AllowUnprotectedDataProtectionKeys=true` khi đã mã hóa cả ổ đĩa) | trống |
+| `AccessLog:RetryDelaysMs` | Chờ giữa các lần thử lại khi CSDL lỗi lúc ghi nhật ký truy cập (hết lượt thì tính là mất, có cảnh báo) | 1000, 2000, 4000, 8000, 15000 |
+| `Antivirus:RequiredInProduction` | `true` thì Production không khởi động khi tắt chống virus | `false` |
+| `Limits:OpsRequestsPerMinute` | Giới hạn gọi `/api/v1/ops/*` mỗi địa chỉ mỗi phút (chống dò khóa máy) | 20 |
+| `Observability:SlowRequestMs` | Request lâu hơn mức này ghi thêm dòng `slow_request` | 2000 |
+
+## Quy tắc
+
+- Mọi endpoint mặc định cần đăng nhập; thêm `.RequirePermission(...)` cho từng thao tác. Phạm vi từng bản ghi kiểm tra trong use case (`IScopeFilter`, BE-15).
+- Chuyển bước hồ sơ chỉ qua hàm SQL `hoso.transition_dossier`, trong transaction có ghi outbox.
+- Không sinh migration bằng EF Core; mọi thay đổi schema là một tệp SQL mới trong `database/migrations`.
+- Lỗi nghiệp vụ ném `AppException` với mã trong `ErrorCodes`; không tự viết ProblemDetails.
+- Không ghi nội dung giấy tờ, số định danh cá nhân, cookie, token vào log.
